@@ -996,43 +996,71 @@ impl platform::Platform for Elf {
         let eh_frame_section = object.object.section(eh_frame_section_index)?;
         let data = object.object.raw_section_data(eh_frame_section)?;
         let frame_index_offset = object.format_specific.exception_frames.len();
-        let exception_frames = match object.relocations(eh_frame_section_index)? {
+
+        // `process_eh_frame_relocations` returns the frames plus the CIE relocations it collected.
+        // We record the frames into the accumulator before processing those relocations, since
+        // processing them can trigger loading a section that walks this object's frame list.
+        match object.relocations(eh_frame_section_index)? {
             RelocationList::Rela(relocations) => {
-                ExceptionFrames::Rela(process_eh_frame_relocations::<A, Rela>(
+                let (frames, deferred) = process_eh_frame_relocations::<A, Rela>(
                     object,
                     common,
                     file_symbol_id_range,
                     resources,
-                    queue,
-                    eh_frame_section,
                     eh_frame_section_index,
                     frame_index_offset,
                     data,
                     &relocations,
-                    scope,
-                )?)
+                )?;
+                object
+                    .format_specific
+                    .exception_frames
+                    .extend(ExceptionFrames::Rela(frames));
+                for rel in &deferred {
+                    process_relocation::<A, _>(
+                        object,
+                        common,
+                        rel,
+                        eh_frame_section,
+                        output_section_id::EH_FRAME.base_part_id(),
+                        resources,
+                        queue,
+                        false,
+                        scope,
+                    )?;
+                }
             }
             RelocationList::Crel(crel_iterator) => {
-                ExceptionFrames::Crel(process_eh_frame_relocations::<A, Crel>(
+                let crels = crel_iterator.collect::<Result<Vec<Crel>, _>>()?;
+                let (frames, deferred) = process_eh_frame_relocations::<A, Crel>(
                     object,
                     common,
                     file_symbol_id_range,
                     resources,
-                    queue,
-                    eh_frame_section,
                     eh_frame_section_index,
                     frame_index_offset,
                     data,
-                    &crel_iterator.collect::<Result<Vec<Crel>, _>>()?,
-                    scope,
-                )?)
+                    &crels,
+                )?;
+                object
+                    .format_specific
+                    .exception_frames
+                    .extend(ExceptionFrames::Crel(frames));
+                for rel in &deferred {
+                    process_relocation::<A, _>(
+                        object,
+                        common,
+                        rel,
+                        eh_frame_section,
+                        output_section_id::EH_FRAME.base_part_id(),
+                        resources,
+                        queue,
+                        false,
+                        scope,
+                    )?;
+                }
             }
-        };
-
-        object
-            .format_specific
-            .exception_frames
-            .extend(exception_frames);
+        }
         Ok(())
     }
 
@@ -2580,24 +2608,26 @@ impl DynamicLayoutStateExt<'_> {
     }
 }
 
-fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Relocation>(
+#[expect(clippy::type_complexity)]
+fn process_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
     object: &mut layout::ObjectLayoutState<'data, Elf>,
     common: &mut layout::CommonGroupState<'data, Elf>,
     file_symbol_id_range: SymbolIdRange,
-    resources: &'scope layout::GraphResources<'data, '_, Elf>,
-    queue: &mut layout::LocalWorkQueue,
-    eh_frame_section: &'data object::elf::SectionHeader64<LittleEndian>,
+    resources: &layout::GraphResources<'data, '_, Elf>,
     eh_frame_section_index: object::SectionIndex,
     frame_index_offset: usize,
     data: &'data [u8],
     relocations: &R::Sequence<'data>,
-    scope: &Scope<'scope>,
-) -> Result<Vec<ExceptionFrame<'data, R>>> {
+) -> Result<(
+    Vec<ExceptionFrame<'data, R>>,
+    Vec<<R::Sequence<'data> as RelocationSequence<'data>>::Rel>,
+)> {
     const PREFIX_LEN: usize = size_of::<EhFrameEntryPrefix>();
 
     let mut rel_iter = relocations.rel_iter().enumerate().peekable();
     let mut offset = 0;
     let mut exception_frames = Vec::new();
+    let mut cie_relocations = Vec::new();
 
     while offset + PREFIX_LEN <= data.len() {
         // Although the section data will be aligned within the object file, there's
@@ -2628,18 +2658,10 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
                 }
 
                 // We currently always load all CIEs, so any relocations found in CIEs always need
-                // to be processed.
-                process_relocation::<A, <R::Sequence<'data> as RelocationSequence>::Rel>(
-                    object,
-                    common,
-                    rel,
-                    eh_frame_section,
-                    output_section_id::EH_FRAME.base_part_id(),
-                    resources,
-                    queue,
-                    false,
-                    scope,
-                )?;
+                // to be processed. We collect them and process them after this object's frames have
+                // been recorded: processing a CIE relocation can load a section that walks our
+                // frame list, so the frames must already be in place (see `load_exception_frame_data`).
+                cie_relocations.push(*rel);
 
                 if let Some(local_sym_index) = rel.symbol() {
                     let local_symbol_id = file_symbol_id_range.input_to_id(local_sym_index);
@@ -2708,7 +2730,7 @@ fn process_eh_frame_relocations<'data, 'scope, A: Arch<Platform = Elf>, R: Reloc
     // actual entry. crtend.o has a single u32 equal to 0 as an end marker.
     object.format_specific.eh_frame_size += (data.len() - offset) as u64;
 
-    Ok(exception_frames)
+    Ok((exception_frames, cie_relocations))
 }
 
 /// Processes the exception frames for a section that we're loading.
@@ -2725,7 +2747,13 @@ fn process_section_exception_frames<'data, 'scope, A: Arch<Platform = Elf>, R: R
     let mut eh_frame_size = 0;
     let mut next_frame_index = frame_index;
     while let Some(frame_index) = next_frame_index {
-        let frame_data = &exception_frames[frame_index.as_usize()];
+        let Some(frame_data) = exception_frames.get(frame_index.as_usize()) else {
+            bail!(
+                "Exception frame index {} out of range ({} frames recorded)",
+                frame_index.as_usize(),
+                exception_frames.len()
+            );
+        };
         next_frame_index = frame_data.previous_frame_for_section;
 
         eh_frame_size += u64::from(frame_data.frame_size);
