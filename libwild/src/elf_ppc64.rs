@@ -67,6 +67,13 @@ impl crate::platform::Arch for ElfPpc64 {
         &[]
     }
 
+    fn local_entry_offset(st_other: u8) -> u64 {
+        // ELFv2 encodes the distance from a function's global entry point to its local entry point
+        // in st_other bits [7:5]: offset = ((1 << k) >> 2) << 2 (k=0,1 -> 0; 2 -> 4; 3 -> 8; ...).
+        let k = (st_other & object::elf::STO_PPC64_LOCAL_MASK) >> object::elf::STO_PPC64_LOCAL_BIT;
+        u64::from(((1u32 << k) >> 2) << 2)
+    }
+
     #[allow(unused_variables)]
     #[inline(always)]
     fn new_relaxation(
